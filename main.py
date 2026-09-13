@@ -1,153 +1,221 @@
-"""Main Agent logic for Kaggriculture with dynamic cascading priority execution."""
+"""Kaggriculture Agent — farmer-only, tile-list eksplisit.
 
-from typing import Any, Dict, List, Optional, Tuple
-from pathfinding import get_closest_target, get_next_step
-
-
-class DynamicFarmAgent:
-    """Agent orchestrating farmer and farm hands with dynamic fallback priorities."""
-
-    def __init__(self, max_coops: int = 5) -> None:
-        self.max_coops = max_coops
-
-    def evaluate_farm_state(self, obs: Dict[str, Any]) -> Dict[str, Any]:
-        """Extracts and parses relevant metrics from game observation."""
-        player = obs["player"]
-        farm = obs["farms"][player]
-        private = obs.get("private", {}) or {}
-
-        tiles = farm["tiles"]
-        board_size = len(tiles)
-
-        coop_count = 0
-        plant_tiles: List[Tuple[int, int]] = []
-        unwatered_plants: List[Tuple[int, int]] = []
-        harvestable_plants: List[Tuple[int, int]] = []
-        empty_tiles: List[Tuple[int, int]] = []
-        unfertilized_plants: List[Tuple[int, int]] = []
-
-        for y in range(board_size):
-            for x in range(board_size):
-                tile = tiles[y][x]
-                if tile == "LOCKED":
-                    continue
-                if tile is None:
-                    empty_tiles.append((x, y))
-                elif isinstance(tile, dict):
-                    kind = tile.get("kind")
-                    if kind == "COOP":
-                        coop_count += 1
-                    elif kind == "PLANT":
-                        plant_tiles.append((x, y))
-                        if tile.get("yield_units", 0) > 0:
-                            harvestable_plants.append((x, y))
-                        if not tile.get("watered_today", False):
-                            unwatered_plants.append((x, y))
-                        if tile.get("fertilized_until_day", -1) < obs.get("day", 0):
-                            unfertilized_plants.append((x, y))
-
-        return {
-            "coop_count": coop_count,
-            "harvestable": harvestable_plants,
-            "unwatered": unwatered_plants,
-            "unfertilized": unfertilized_plants,
-            "empty_tiles": empty_tiles,
-            "seeds": private.get("seeds", {}),
-            "shed": private.get("shed", {}),
-            "money": farm["money"],
-            "farmer_pos": tuple(farm["farmer"]),
-            "board_size": board_size,
-        }
-
-    def execute_cascading_priority(
-        self, state: Dict[str, Any], priority_chain: List[str]
-    ) -> List[Any]:
-        """Executes actions based on a strict priority chain with fallback logic.
-
-        Supported Priorities in order:
-        - "BUILD_COOP": Build coop up to self.max_coops limit
-        - "HARVEST": Harvest any ready crops
-        - "PLANT": Plant seeds if available in inventory/seeds
-        - "WATER": Water crops needing daily care
-        - "FERTILIZE": Apply fertilizer if available
-        - "PASS": Do nothing if no actions available
-        """
-        fx, fy = state["farmer_pos"]
-        board_size = state["board_size"]
-        seeds = state["seeds"]
-
-        for priority in priority_chain:
-            # Priority 1: BUILD COOP (with quota check)
-            if priority == "BUILD_COOP":
-                if state["coop_count"] < self.max_coops and state["empty_tiles"]:
-                    target = state["empty_tiles"][0]
-                    if (fx, fy) == target:
-                        return ["BUILD_COOP"]
-                    step = get_next_step((fx, fy), target, board_size)
-                    if step:
-                        return [step]
-
-            # Priority 2: HARVEST
-            elif priority == "HARVEST":
-                if state["harvestable"]:
-                    if (fx, fy) in state["harvestable"]:
-                        return ["HARVEST"]
-                    res = get_closest_target((fx, fy), state["harvestable"], board_size)
-                    if res:
-                        return [res[1]]
-
-            # Priority 3: PLANT (Checks seed availability)
-            elif priority == "PLANT":
-                available_crops = [crop for crop, count in seeds.items() if count > 0]
-                if available_crops and state["empty_tiles"]:
-                    selected_crop = available_crops[0]
-                    if (fx, fy) in state["empty_tiles"]:
-                        return ["PLANT", selected_crop]
-                    res = get_closest_target((fx, fy), state["empty_tiles"], board_size)
-                    if res:
-                        return [res[1]]
-
-            # Priority 4: WATER
-            elif priority == "WATER":
-                if state["unwatered"]:
-                    if (fx, fy) in state["unwatered"]:
-                        return ["WATER"]
-                    res = get_closest_target((fx, fy), state["unwatered"], board_size)
-                    if res:
-                        return [res[1]]
-
-            # Priority 5: FERTILIZE
-            elif priority == "FERTILIZE":
-                if state["shed"].get("FERTILIZER", 0) > 0 and state["unfertilized"]:
-                    if (fx, fy) in state["unfertilized"]:
-                        return ["FERTILIZE"]
-                    res = get_closest_target((fx, fy), state["unfertilized"], board_size)
-                    if res:
-                        return [res[1]]
-
-        return ["PASS"]
-
-
-# Agent entry point for Kaggle Environment
-agent_instance = DynamicFarmAgent(max_coops=5)
-
-
-def agent(obs: Dict[str, Any], config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Top-level agent function adhering to Kaggriculture specification."""
-    state = agent_instance.evaluate_farm_state(obs)
-
-    # Define strict priority sequence
-    priority_sequence = ["BUILD_COOP", "HARVEST", "PLANT", "WATER", "FERTILIZE"]
-
-    # Compute action for primary farmer
-    farmer_action = agent_instance.execute_cascading_priority(state, priority_sequence)
-
-    # Simple Market Logic: Buy Seeds if short on crops and money is available
-    market_orders = []
-    if state["money"] >= 80 and sum(state["seeds"].values()) == 0:
-        market_orders.append(["BUY_SEED", "MELON", 1])
-
-    return {"farmer": farmer_action, "hands": [], "market": market_orders}
+Layout:
+  Coop   : baris y=4, dari (4,4) ke (0,4)  → dekat shed, mundur ke barat
+  Wheat  : baris y=3, dari (0,3) ke (2,3)  → 1 tile di atas coop
 """
-[cite: 1]
-"""
+
+from typing import Any, Dict, List, Tuple
+
+from pathfinding import (
+    get_route_actions, extract_blocked_from_tiles, sort_by_distance,
+    find_harvest_tiles, find_water_tiles, find_feed_tiles,
+    find_collect_fertilizer_tiles, find_fertilize_tiles,
+    find_place_goose_tiles,
+)
+from market import decide_market_orders
+
+
+# =====================================================================
+# CONFIG — semua di sini
+# =====================================================================
+CONFIG = {
+    "BUY_GOOSE": 5,
+    "BUY_WHEAT_SEED": 5,
+    "BUY_FERTILIZER": 5,
+    "BUY_WHEAT_FEED": 15,
+
+    "WHEAT_CYCLE_DAYS": 3,
+
+    "DAILY_BUY_WHEAT_FEED": 5,
+    "HIRE_HAND": False,          # ← MATIKAN karena kita farmer-only
+
+    "KEEP_FERTILIZER": 10,
+    "WHEAT_SHED_BUFFER": 10,
+
+    "GRID_W": 10,
+    "GRID_H": 10,
+    "TURNS_PER_DAY": 24,
+}
+
+# ---------------------------------------------------------------------
+# TILE LAYOUT — tinggal edit di sini
+# ---------------------------------------------------------------------
+# Urutan coop: dimulai dari yang paling dekat dengan shed (4,4),
+# lalu mundur ke barat. Farmer spawn di (4,4) jadi langsung bisa build.
+COOP_TILES: List[Tuple[int, int]] = [
+    (4, 4),
+    (3, 4),
+    (2, 4),
+    (1, 4),
+    (0, 4),
+]
+
+# Wheat 1 tile di atas coop (y=3), dari barat ke timur
+WHEAT_TILES: List[Tuple[int, int]] = [
+    (0, 3),
+    (1, 3),
+    (2, 3),
+    (3, 3),
+    (4, 3),
+]
+
+SHED_ADJACENT = [(4, 4), (5, 4), (4, 5), (5, 5)]
+
+
+# =====================================================================
+# PRIORITAS
+# =====================================================================
+PRIORITY_ORDER = [
+    "HARVEST",
+    "BUILD_COOP",
+    "PLACE_GOOSE",
+    "PLANT",
+    "FEED",
+    "COLLECT_FERTILIZER",
+    "FERTILIZE",
+    "WATER",
+]
+
+ACTION_FOR_PRIORITY = {
+    "HARVEST":            ["HARVEST"],
+    "BUILD_COOP":         ["BUILD_COOP"],
+    "PLACE_GOOSE":        ["PLACE", "GOOSE"],
+    "PLANT":              ["PLANT", "WHEAT"],
+    "FEED":               ["FEED"],
+    "COLLECT_FERTILIZER": ["COLLECT_FERTILIZER"],
+    "FERTILIZE":          ["FERTILIZE"],
+    "WATER":              ["WATER"],
+}
+
+ACTION_NEEDS_ITEM = {
+    "PLACE_GOOSE": "GOOSE",
+    "FEED":        "WHEAT",
+    "FERTILIZE":   "FERTILIZER",
+}
+
+
+# =====================================================================
+# LOCATOR — pakai list eksplisit, bukan "farthest" dynamic
+# =====================================================================
+def tasks_build_coop(tiles):
+    """Tile di COOP_TILES yang masih kosong (None)."""
+    out = []
+    for (x, y) in COOP_TILES:
+        if 0 <= y < len(tiles) and 0 <= x < len(tiles[0]):
+            if tiles[y][x] is None:
+                out.append((x, y))
+    return out
+
+
+def tasks_plant_wheat(tiles):
+    """Tile di WHEAT_TILES yang masih kosong."""
+    out = []
+    for (x, y) in WHEAT_TILES:
+        if 0 <= y < len(tiles) and 0 <= x < len(tiles[0]):
+            if tiles[y][x] is None:
+                out.append((x, y))
+    return out
+
+
+def tasks_place_goose(tiles):
+    """Coop kosong (belum ada goose) — hanya di COOP_TILES."""
+    out = []
+    for (x, y) in COOP_TILES:
+        t = tiles[y][x]
+        if isinstance(t, dict) and t.get("kind") == "COOP" \
+           and t.get("animal") is None:
+            out.append((x, y))
+    return out
+
+
+# =====================================================================
+# SCAN TASK
+# =====================================================================
+def scan_tasks(tiles, current_day):
+    return {
+        "HARVEST":            find_harvest_tiles(tiles, current_day),
+        "BUILD_COOP":         tasks_build_coop(tiles),
+        "PLACE_GOOSE":        tasks_place_goose(tiles),
+        "PLANT":              tasks_plant_wheat(tiles),
+        "FEED":               find_feed_tiles(tiles),
+        "COLLECT_FERTILIZER": find_collect_fertilizer_tiles(tiles),
+        "FERTILIZE":          find_fertilize_tiles(tiles),
+        "WATER":              find_water_tiles(tiles),
+    }
+
+
+# =====================================================================
+# PICK TASK
+# =====================================================================
+def _get_inv(obs, idx=0):
+    priv = obs.get("private", {}) or {}
+    invs = priv.get("inventories", []) or []
+    return invs[idx] if idx < len(invs) else {}
+
+
+def _shed(obs, item):
+    return (obs.get("private", {}) or {}).get("shed", {}).get(item, 0)
+
+
+def pick_task(tasks, origin, inventory, obs):
+    for p in PRIORITY_ORDER:
+        tiles = tasks.get(p)
+        if not tiles:
+            continue
+
+        # Auto-pickup: kalau butuh item tapi inventory kosong
+        need = ACTION_NEEDS_ITEM.get(p)
+        if need and inventory.get(need, 0) <= 0:
+            if _shed(obs, need) <= 0:
+                continue
+            target = sort_by_distance(SHED_ADJACENT, origin)[0]
+            qty = min(5, len(tiles))
+            return p, target, ["PICKUP", need, qty]
+
+        # Pilih target terdekat
+        target = sort_by_distance(tiles, origin)[0]
+        return p, target, ACTION_FOR_PRIORITY[p]
+    return None
+
+
+# =====================================================================
+# AGENT
+# =====================================================================
+def agent(obs):
+    step = obs.get("step")
+    if step is None:
+        step = obs["day"] * 24 + obs["hour"]
+
+    player = obs.get("player", 0)
+    farms = obs.get("farms", [])
+    if not farms or player >= len(farms):
+        return {"farmer": ["PASS"], "hands": [], "market": []}
+
+    me = farms[player]
+    farmer_pos = tuple(me["farmer"])
+    tiles = me["tiles"]
+    blocked = extract_blocked_from_tiles(tiles)
+
+    market_orders = decide_market_orders(obs, CONFIG)
+    tasks = scan_tasks(tiles, obs["day"])
+
+    farmer_action = ["PASS"]
+    inv = _get_inv(obs, 0)
+    pick = pick_task(tasks, farmer_pos, inv, obs)
+    if pick is not None:
+        _, target, action = pick
+        if farmer_pos == target:
+            farmer_action = action
+        else:
+            route = get_route_actions(farmer_pos, target,
+                                      width=CONFIG["GRID_W"],
+                                      height=CONFIG["GRID_H"],
+                                      blocked=blocked)
+            farmer_action = [route[0]] if route else ["PASS"]
+
+    return {
+        "farmer": farmer_action,
+        "hands": [],
+        "market": market_orders,
+    }
